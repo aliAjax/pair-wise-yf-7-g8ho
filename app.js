@@ -41,6 +41,7 @@ const els = {
   styleFilter: document.querySelector("#styleFilter"),
   selectedTypeLabel: document.querySelector("#selectedTypeLabel"),
   shortageBadge: document.querySelector("#shortageBadge"),
+  notice: document.querySelector("#notice"),
   usageList: document.querySelector("#usageList"),
   draftList: document.querySelector("#draftList"),
   placedCount: document.querySelector("#placedCount"),
@@ -55,14 +56,36 @@ function loadState() {
   if (!saved) return structuredClone(defaultState);
   try {
     const parsed = JSON.parse(saved);
-    return {
+    const merged = {
       ...structuredClone(defaultState),
       ...parsed,
       settings: { ...defaultState.settings, ...parsed.settings }
     };
+    // 旧版格子只有 typeId 单层，统一归一化为 layers（底字在前，上层在后）
+    merged.placements = normalizePlacements(merged.placements);
+    merged.drafts = (merged.drafts || []).map((draft) => ({
+      ...draft,
+      placements: normalizePlacements(draft.placements)
+    }));
+    return merged;
   } catch {
     return structuredClone(defaultState);
   }
+}
+
+// 旧草稿/旧状态的 { row, col, typeId } 按单层打开；新版两层结构直接保留顺序
+function normalizePlacements(placements) {
+  return (Array.isArray(placements) ? placements : [])
+    .map((placement) => {
+      if (Array.isArray(placement?.layers)) {
+        return { row: placement.row, col: placement.col, layers: placement.layers.slice(0, 2) };
+      }
+      if (placement?.typeId) {
+        return { row: placement.row, col: placement.col, layers: [placement.typeId] };
+      }
+      return null;
+    })
+    .filter(Boolean);
 }
 
 function saveState() {
@@ -84,9 +107,12 @@ function getSelectedType() {
   return state.inventory.find((item) => item.id === state.selectedTypeId) || null;
 }
 
+// 底字和上层分别占用库存
 function getUsage() {
   return state.placements.reduce((acc, placement) => {
-    acc[placement.typeId] = (acc[placement.typeId] || 0) + 1;
+    placement.layers.forEach((typeId) => {
+      acc[typeId] = (acc[typeId] || 0) + 1;
+    });
     return acc;
   }, {});
 }
@@ -147,11 +173,24 @@ function renderStage() {
   for (let row = 0; row < rows; row += 1) {
     for (let col = 0; col < cols; col += 1) {
       const placement = map.get(placementKey(row, col));
-      const type = placement ? state.inventory.find((item) => item.id === placement.typeId) : null;
+      const layers = placement
+        ? placement.layers.map((typeId) => state.inventory.find((item) => item.id === typeId)).filter(Boolean)
+        : [];
       const vertical = state.settings.flowMode === "vertical" ? "vertical" : "";
+      const classes = ["cell", layers.length ? "used" : "", layers.length > 1 ? "layered" : "", vertical]
+        .filter(Boolean)
+        .join(" ");
+      const content = layers
+        .map((type, index) => {
+          const cls = index === 0 ? "layer-bottom" : "layer-top";
+          const fontSize =
+            index === 0 ? Math.min(type.size, 30) : Math.max(9, Math.round(type.size * 0.55));
+          return `<span class="${cls}" style="font-size:${fontSize}px">${escapeHtml(type.char)}</span>`;
+        })
+        .join("");
       cells.push(`
-        <button class="cell ${type ? "used" : ""} ${vertical}" data-row="${row}" data-col="${col}" type="button" aria-label="第${row + 1}行第${col + 1}列">
-          ${type ? escapeHtml(type.char) : ""}
+        <button class="${classes}" data-row="${row}" data-col="${col}" type="button" aria-label="第${row + 1}行第${col + 1}列">
+          ${content}
         </button>
       `);
     }
@@ -162,7 +201,8 @@ function renderStage() {
 function renderUsage() {
   const usage = getUsage();
   const entries = state.inventory.filter((item) => usage[item.id]);
-  els.placedCount.textContent = `${state.placements.length}个落字`;
+  const layerCount = state.placements.reduce((sum, placement) => sum + placement.layers.length, 0);
+  els.placedCount.textContent = `${state.placements.length}格 · ${layerCount}层落字`;
 
   const shortages = entries.filter((item) => usage[item.id] > item.quantity);
   els.shortageBadge.textContent = shortages.length ? `${shortages.length}处超量` : "数量充足";
@@ -193,7 +233,7 @@ function renderDrafts() {
         (draft) => `
           <article class="draft-item">
             <strong>${escapeHtml(draft.title)}</strong>
-            <span>${draft.placements.length}个落字 · ${new Date(draft.savedAt).toLocaleString("zh-CN")}</span>
+            <span>${draft.placements.length}格 · ${draft.placements.reduce((sum, item) => sum + item.layers.length, 0)}层 · ${new Date(draft.savedAt).toLocaleString("zh-CN")}</span>
             <div class="draft-actions">
               <button type="button" data-load-draft="${draft.id}">载入</button>
               <button type="button" data-delete-draft="${draft.id}">删除</button>
@@ -214,17 +254,74 @@ function renderAll() {
   renderDrafts();
 }
 
+let noticeTimer = null;
+
+function showNotice(message) {
+  els.notice.textContent = message;
+  els.notice.classList.add("show");
+  clearTimeout(noticeTimer);
+  noticeTimer = setTimeout(() => els.notice.classList.remove("show"), 3600);
+}
+
+// 再放一层后，该字模库存是否还够
+function hasStock(typeId) {
+  const type = state.inventory.find((item) => item.id === typeId);
+  if (!type) return false;
+  const used = getUsage()[typeId] || 0;
+  return used + 1 <= type.quantity;
+}
+
 function placeType(row, col, typeId = state.selectedTypeId) {
   if (!typeId) return;
-  const existingIndex = state.placements.findIndex((item) => item.row === row && item.col === col);
-  if (existingIndex >= 0) {
-    if (state.placements[existingIndex].typeId === typeId) {
-      state.placements.splice(existingIndex, 1);
-    } else {
-      state.placements[existingIndex].typeId = typeId;
+  const type = state.inventory.find((item) => item.id === typeId);
+  if (!type) return;
+  const index = state.placements.findIndex((item) => item.row === row && item.col === col);
+  const placement = index >= 0 ? state.placements[index] : null;
+
+  // 空格：放底字
+  if (!placement) {
+    if (!hasStock(typeId)) {
+      showNotice(`「${type.char}」字模数量不够，格子保持原样。`);
+      return;
     }
+    state.placements.push({ row, col, layers: [typeId] });
+    renderAll();
+    return;
+  }
+
+  const layers = placement.layers;
+  const topId = layers[layers.length - 1];
+  // 再点一次最上层的字模：撤掉上层（只有一层时即清空该格）
+  if (topId === typeId) {
+    layers.pop();
+    if (!layers.length) state.placements.splice(index, 1);
+    renderAll();
+    return;
+  }
+
+  // 同一件字模不能叠在自己上面
+  if (layers[0] === typeId) {
+    showNotice("同一件字模不能叠在自己上面，格子保持原样。");
+    return;
+  }
+
+  // 上层必须是小一号的强调字：字号不能大于底字
+  const bottom = state.inventory.find((item) => item.id === layers[0]);
+  if (bottom && type.size > bottom.size) {
+    showNotice(`上层字号 ${type.size}px 大于底字 ${bottom.size}px，格子保持原样。`);
+    return;
+  }
+
+  // 两层分别占库存，任一层数量不够都不能落
+  if (!hasStock(typeId)) {
+    showNotice(`「${type.char}」字模数量不够，格子保持原样。`);
+    return;
+  }
+
+  if (layers.length >= 2) {
+    layers[layers.length - 1] = typeId; // 已有两层：切换上层
   } else {
-    state.placements.push({ row, col, typeId });
+    layers.push(typeId); // 底字之上叠上层，后放的在上面
   }
   renderAll();
 }
@@ -282,17 +379,28 @@ function exportPreview() {
   ctx.fillText(state.settings.workTitle || "未命名作品", margin, 50);
   ctx.font = "bold 30px serif";
   state.placements.forEach((placement) => {
-    const type = state.inventory.find((item) => item.id === placement.typeId);
-    if (!type) return;
+    const layers = placement.layers
+      .map((typeId) => state.inventory.find((item) => item.id === typeId))
+      .filter(Boolean);
+    if (!layers.length) return;
     const x = margin + placement.col * (cell + gap);
     const y = margin + 45 + placement.row * (cell + gap);
     ctx.fillStyle = "#2f2921";
     ctx.fillRect(x, y, cell, cell);
-    ctx.fillStyle = "#fff5df";
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    ctx.font = `900 ${Math.min(type.size + 8, 42)}px serif`;
-    ctx.fillText(type.char, x + cell / 2, y + cell / 2);
+    // 底字居中，先压
+    const bottom = layers[0];
+    ctx.fillStyle = "#fff5df";
+    ctx.font = `900 ${Math.min(bottom.size + 8, 42)}px serif`;
+    ctx.fillText(bottom.char, x + cell / 2, y + cell / 2);
+    // 上层小一号，后放的在上面，叠在格角
+    const top = layers[1];
+    if (top) {
+      ctx.fillStyle = "#d9a441";
+      ctx.font = `900 ${Math.max(12, Math.min(top.size, 20))}px serif`;
+      ctx.fillText(top.char, x + cell - 13, y + 13);
+    }
   });
   const link = document.createElement("a");
   link.download = `${state.settings.workTitle || "movable-type"}.png`;
@@ -346,7 +454,9 @@ els.typeList.addEventListener("click", (event) => {
   if (deleteButton) {
     const typeId = deleteButton.dataset.deleteType;
     state.inventory = state.inventory.filter((item) => item.id !== typeId);
-    state.placements = state.placements.filter((item) => item.typeId !== typeId);
+    state.placements = state.placements
+      .map((placement) => ({ ...placement, layers: placement.layers.filter((id) => id !== typeId) }))
+      .filter((placement) => placement.layers.length > 0);
     if (state.selectedTypeId === typeId) state.selectedTypeId = state.inventory[0]?.id || null;
     renderAll();
     return;
@@ -387,7 +497,7 @@ els.draftList.addEventListener("click", (event) => {
     const draft = state.drafts.find((item) => item.id === loadButton.dataset.loadDraft);
     if (!draft) return;
     state.settings = structuredClone(draft.settings);
-    state.placements = structuredClone(draft.placements);
+    state.placements = normalizePlacements(structuredClone(draft.placements));
     renderAll();
   }
   if (deleteButton) {
